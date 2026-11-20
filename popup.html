@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Twitch DMCA Unmute</h1>
+      <label class="toggle"><input type="checkbox" id="enabled" /><span>On</span></label>
+    </header>
+
+    <p id="status" class="status">Open a Twitch VOD and reload the page.</p>
+    <p id="age" class="age hidden"></p>
+    <p id="clips" class="age hidden"></p>
+    <p id="why" class="why hidden"></p>
+
+    <ul id="ranges" class="ranges"></ul>
+
+    <footer>
+      <button id="reload">Reload &amp; re-scan</button>
+      <label class="opt"><input type="checkbox" id="crossQuality" /> Use another quality when the original is gone</label>
+      <label class="opt"><input type="checkbox" id="prefetchAll" /> Grab all originals as soon as the VOD opens</label>
+      <details id="diagBox">
+        <summary>Diagnostics</summary>
+        <p id="counters" class="counters"></p>
+        <pre id="diag" class="diag"></pre>
+        <button id="copy" class="ghost">Copy diagnostics</button>
+        <button id="retry" class="ghost">Retry failed segments</button>
+        <button id="clear" class="ghost">Clear cached audio</button>
+      </details>
+    </footer>
+    <script src="popup.js"></script>
+  </body>
+</html>

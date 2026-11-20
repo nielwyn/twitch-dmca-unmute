@@ -1,0 +1,49 @@
+{
+  "manifest_version": 2,
+  "name": "Twitch DMCA Unmute",
+  "version": "4.0.0",
+  "description": "Restores DMCA-muted Twitch VOD audio: unmuted originals while they exist, then Kick's copy of the stream, then clips.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "twitch-dmca-unmute@local",
+      "strict_min_version": "109.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  },
+  "permissions": [
+    "webRequest",
+    "webRequestBlocking",
+    "storage",
+    "unlimitedStorage",
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "browser_action": {
+    "default_title": "Twitch DMCA Unmute",
+    "default_popup": "popup.html",
+    "default_icon": "icons/icon.svg"
+  },
+  "icons": {
+    "48": "icons/icon.svg",
+    "96": "icons/icon.svg"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.twitch.tv/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
