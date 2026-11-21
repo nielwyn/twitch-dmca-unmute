@@ -129,9 +129,44 @@
       if (c && (c.end < t - 60 || c.start > t + 300)) {
         clipState.delete(key);
         kickClips.delete(key);
-        if (st.file) st.file.then((url) => url && (!current || current.url !== url) && URL.revokeObjectURL(url));
+        if (st.file) st.file.then((url) => url && (!current || current.url !== url) && drop(url));
       }
     }
+  }
+
+  /**
+   * One <audio> per chunk/clip URL. The next chunk gets its element ahead of
+   * time, so a handover is an element swap with metadata already loaded
+   * instead of a src change that stalls ~0.2 s.
+   */
+  const players = new Map();
+  function player(url) {
+    let a = players.get(url);
+    if (!a) {
+      a = new Audio();
+      a.preload = "auto";
+      a.src = url;
+      players.set(url, a);
+    }
+    return a;
+  }
+
+  function drop(url) {
+    const a = players.get(url);
+    if (a) {
+      a.pause();
+      a.removeAttribute("src");
+      a.load();
+      players.delete(url);
+    }
+    URL.revokeObjectURL(url);
+  }
+
+  /** Fetch a chunk and load it into its own element, for gapless switching. */
+  function warm(clip) {
+    if (!clip) return;
+    const st = stateFor(clip);
+    if (st.url) player(st.url);
   }
 
   function stateFor(clip) {
@@ -151,6 +186,7 @@
         .then((buf) => (buf ? URL.createObjectURL(new Blob([buf], { type: kick ? "audio/wav" : "video/mp4" })) : null))
         .catch(() => null);
       st.file.then((url) => {
+        st.url = url;
         if (!url) setTimeout(() => (st.file = null), 30000);
       });
     }
@@ -266,11 +302,16 @@
     const t = v.currentTime;
     const range = plan.ranges.find((r) => t >= r.start && t < r.end);
     const inMuted = !!range;
+    if (plan.kick) {
+      // Fetch the next range's first chunk before the playhead gets there.
+      const next = plan.ranges.find((r) => r.start > t && r.start - t < 30);
+      if (next) warm(kickClip(next, next.start, plan.kick.chunk));
+    }
     let clip = null;
     if (inMuted && plan.kick) {
       // Full audio from Kick's copy of the stream, cut into chunks.
       clip = kickClip(range, t, plan.kick.chunk);
-      if (clip && clip.end - t < 25 && clip.end < range.end) stateFor(kickClip(range, clip.end, plan.kick.chunk));
+      if (clip && clip.end - t < 25 && clip.end < range.end) warm(kickClip(range, clip.end, plan.kick.chunk));
       pruneKick(t);
     } else if (inMuted) {
       for (const c of plan.clips) {
@@ -291,7 +332,7 @@
     const st = stateFor(clip);
     if (!current || current.clip !== clip) {
       if (audio) audio.pause();
-      current = { clip, entry: st, url: null };
+      current = { clip, entry: st, url: st.url || null }; // preloaded: start this tick
       st.file.then((url) => {
         if (current && current.clip === clip) current.url = url;
       });
@@ -313,13 +354,10 @@
       debug({ state: "loading", kind: clip.kind || "clip", slug: clip.slug, t });
       return;
     }
-    if (!audio) {
-      audio = new Audio();
-      audio.preload = "auto";
-    }
-    if (audio.dataset.src !== current.url) {
-      audio.src = current.url;
-      audio.dataset.src = current.url;
+    const a = player(current.url);
+    if (audio !== a) {
+      if (audio) audio.pause();
+      audio = a;
     }
 
     audio.volume = v.muted ? 0 : v.volume;
@@ -329,7 +367,8 @@
       if (!audio.paused) audio.pause();
     } else {
       if (audio.readyState >= 1 && Math.abs(audio.currentTime - want) > MAX_DRIFT) audio.currentTime = want;
-      if (audio.paused) {
+      // Before metadata the position can't be set, and play() would start at 0.
+      if (audio.paused && audio.readyState >= 1) {
         audio.play().then(
           () => (playError = null),
           (err) => {

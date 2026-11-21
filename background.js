@@ -1053,7 +1053,7 @@ function coveredSeconds(clips, ranges) {
  * 3 points). So: find the Kick VOD, measure the offset ourselves on an
  * unmuted stretch, then serve muted ranges as WAV chunks cut from Kick audio.
  */
-const KICK_CHUNK_S = 120;
+const KICK_CHUNK_S = 30; // small enough that a seek into a range gets audio quickly
 const KICK_SR = 32000;
 /** vodKey -> { url, segs } of the Twitch media playlist. */
 const vodPlaylists = new Map();
@@ -1128,14 +1128,20 @@ function tsToAdts(u8) {
 
 /** Fetch TS segments, keep their audio, decode to mono Float32 at KICK_SR. */
 async function decodeSegments(urls) {
-  const adts = [];
-  for (const url of urls) {
-    const res = await timedFetch(url, false);
-    if (!res.ok) throw new Error("segment HTTP " + res.status);
-    const a = tsToAdts(new Uint8Array(await res.arrayBuffer()));
-    if (!a) throw new Error("no audio in segment");
-    adts.push(a);
-  }
+  // Fetched 6 at a time: one by one, a 2-minute chunk took ~5 s to arrive.
+  const adts = new Array(urls.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < urls.length) {
+      const i = next++;
+      const res = await timedFetch(urls[i], false);
+      if (!res.ok) throw new Error("segment HTTP " + res.status);
+      const a = tsToAdts(new Uint8Array(await res.arrayBuffer()));
+      if (!a) throw new Error("no audio in segment");
+      adts[i] = a;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(6, urls.length) }, worker));
   const all = new Uint8Array(adts.reduce((n, x) => n + x.length, 0));
   let o = 0;
   for (const x of adts) {
@@ -1315,6 +1321,17 @@ async function kickChunk(videoId, a, b) {
   }
 }
 
+/** Union of {start, end} ranges; touching ranges (gap < 0.5 s) are joined. */
+function mergeRanges(list) {
+  const out = [];
+  for (const r of list.slice().sort((a, b) => a.start - b.start)) {
+    const last = out[out.length - 1];
+    if (last && r.start <= last.end + 0.5) last.end = Math.max(last.end, r.end);
+    else out.push({ start: r.start, end: r.end });
+  }
+  return out;
+}
+
 async function clipPlan(videoId, tabId) {
   if (!/^\d+$/.test(String(videoId))) return { ready: true, ranges: [], clips: [] };
   const rep = reportFor(tabId);
@@ -1334,7 +1351,13 @@ async function clipPlan(videoId, tabId) {
   // ranges whose original segments are fully cached (those play via injection).
   const report = tabReports.get(tabId);
   const done = report ? report.ranges.filter((r) => r.total > 0 && r.cached === r.total) : [];
-  const ranges = found.muted.filter((m) => !done.some((r) => r.id <= m.start && r.endSec >= m.end));
+  // muteInfo often ends ~10 s before the last -muted.ts segment does, so merge
+  // in the playlist's segment ranges (where the silence really is).
+  const rows = report ? report.ranges.filter((r) => typeof r.endSec === "number" && !done.includes(r)) : [];
+  const ranges = mergeRanges([
+    ...found.muted.filter((m) => !done.some((r) => r.id <= m.start && r.endSec >= m.end)),
+    ...rows.map((r) => ({ start: r.id, end: r.endSec }))
+  ]);
   const useful = found.clips.filter((c) => ranges.some((r) => c.start < r.end && c.end > r.start));
   if (report) {
     report.clipStatus = "ok";
