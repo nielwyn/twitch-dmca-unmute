@@ -45,6 +45,10 @@
     return m ? m[1] : null;
   };
 
+  /** [start, end] spans where Twitch's own audio was restored (originals injected). */
+  let real = [];
+  const isReal = (t) => real.some((r) => t >= r[0] && t < r[1]);
+
   let lastSent = "";
   let lastSentAt = 0;
   function debug(state) {
@@ -57,7 +61,10 @@
     if (key !== lastSent || Date.now() - lastSentAt > 2000) {
       lastSent = key;
       lastSentAt = Date.now();
-      browser.runtime.sendMessage({ type: "clipState", state }).catch(() => {});
+      browser.runtime
+        .sendMessage({ type: "clipState", state })
+        .then((r) => r && Array.isArray(r.real) && (real = r.real))
+        .catch(() => {});
     }
   }
 
@@ -291,6 +298,27 @@
     } catch (_) {}
   }
 
+  /**
+   * The 150 ms tick alone lands up to 150 ms late on a range edge, which is
+   * audible as Kick and Twitch overlapping (exit) or a gap (entry). When an
+   * edge is close, run one extra tick right at it.
+   */
+  let edgeTimer = 0;
+  function scheduleEdge(v, t) {
+    if (edgeTimer || v.paused || v.seeking) return;
+    let edge = Infinity;
+    for (const r of plan.ranges.map((x) => [x.start, x.end]).concat(real)) {
+      if (r[0] > t) edge = Math.min(edge, r[0]);
+      if (r[1] > t) edge = Math.min(edge, r[1]);
+    }
+    const wait = (edge - t) / (v.playbackRate || 1);
+    if (wait > TICK_MS / 1000 + 0.05) return;
+    edgeTimer = setTimeout(() => {
+      edgeTimer = 0;
+      tick();
+    }, Math.max(0, wait * 1000) + 5);
+  }
+
   function tick() {
     refreshPlan();
     const v = mainVideo();
@@ -300,6 +328,12 @@
     }
 
     const t = v.currentTime;
+    scheduleEdge(v, t);
+    if (isReal(t)) {
+      // The original segment is playing: Twitch already has the real audio here.
+      debug({ state: "original", t });
+      return stop();
+    }
     const range = plan.ranges.find((r) => t >= r.start && t < r.end);
     const inMuted = !!range;
     if (plan.kick) {

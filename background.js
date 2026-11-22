@@ -740,17 +740,20 @@ async function processPlaylist(body, playlistUrl, tabId) {
         missing: 0,
         injected: 0,
         urls: [],
-        times: []
+        times: [],
+        durs: []
       };
       report.ranges.push(row);
     }
     row.urls = [];
     row.times = [];
+    row.durs = [];
     for (const seg of range.segments) {
       const abs = new URL(seg.path, playlistUrl).href;
       owner.set(abs, { tabId, rangeId: id }); // always claim it, even if seen earlier
       row.urls.push(abs);
       row.times.push(seg.start);
+      row.durs.push(seg.duration);
       wanted.push(abs);
     }
     // Authoritative snapshot: downloads that finished before this row existed
@@ -834,6 +837,23 @@ function attachTextFilter(details, transform, { sniff }) {
 
 /* ------------------------------------------- byte injection (the segments) */
 
+/**
+ * Remember which seconds now carry Twitch's real audio, so the page script
+ * doesn't play Kick or clip audio on top of it. Matched by segment file name,
+ * since the player may be on another rendition than the one last parsed.
+ */
+function markReal(report, url) {
+  const name = "/" + new URL(url).pathname.split("/").pop();
+  for (const row of report.ranges) {
+    const i = (row.urls || []).findIndex((u) => u.endsWith(name));
+    if (i < 0 || !row.times) continue;
+    const span = [row.times[i], row.times[i] + row.durs[i]];
+    report.real = report.real || [];
+    if (!report.real.some((r) => r[0] === span[0])) report.real.push(span);
+    return;
+  }
+}
+
 function injectSegment(details) {
   let filter;
   try {
@@ -861,6 +881,7 @@ function injectSegment(details) {
           if (report) {
             report.injected++;
             bump(details.url, "injected");
+            markReal(report, details.url);
           }
           return;
         }
@@ -1388,13 +1409,14 @@ async function clipPlan(videoId, tabId) {
   // ranges whose original segments are fully cached (those play via injection).
   const report = tabReports.get(tabId);
   const done = report ? report.ranges.filter((r) => r.total > 0 && r.cached === r.total) : [];
-  // muteInfo often ends ~10 s before the last -muted.ts segment does, so merge
-  // in the playlist's segment ranges (where the silence really is).
-  const rows = report ? report.ranges.filter((r) => typeof r.endSec === "number" && !done.includes(r)) : [];
-  const ranges = mergeRanges([
-    ...found.muted.filter((m) => !done.some((r) => r.id <= m.start && r.endSec >= m.end)),
-    ...rows.map((r) => ({ start: r.id, end: r.endSec }))
-  ]);
+  // The silence is exactly the playlist's -muted.ts segments. muteInfo is off
+  // at the edges: it often ends ~10 s early and can start up to 0.5 s early,
+  // which played Kick audio over Twitch's real audio. Use it only when the
+  // playlist hasn't been parsed.
+  const ranges =
+    report && report.ranges.length
+      ? mergeRanges(report.ranges.filter((r) => !done.includes(r)).map((r) => ({ start: r.id, end: r.endSec })))
+      : found.muted;
   const useful = found.clips.filter((c) => ranges.some((r) => c.start < r.end && c.end > r.start));
   if (report) {
     report.clipStatus = "ok";
@@ -1474,6 +1496,7 @@ browser.runtime.onMessage.addListener((message, sender) => {
     if (sender.tab) {
       reportFor(sender.tab.id).live = Object.assign({ at: Date.now() }, message.state);
       if (typeof message.state.t === "number") prefetchNear(sender.tab.id, message.state.t);
+      return Promise.resolve({ real: reportFor(sender.tab.id).real || [] });
     }
     return Promise.resolve(true);
   }

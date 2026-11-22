@@ -136,6 +136,7 @@ async function render() {
         loading: live.kind === "kick" ? "loading Kick audio…" : "loading clip audio…",
         "muted-uncovered": "muted part with no clip — silence is all Twitch has",
         "not-muted": "not in a muted part (original audio)",
+        original: "muted part, but Twitch's original audio was restored here",
         "no-clips": "no usable clips for this VOD",
         "no-plan": "waiting for clip search…"
       }[live.state] || live.state;
