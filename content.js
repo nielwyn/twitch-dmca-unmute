@@ -295,7 +295,7 @@
     refreshPlan();
     const v = mainVideo();
     if (!v || !plan || ((!plan.clips || plan.clips.length === 0) && !plan.kick)) {
-      debug({ state: plan ? "no-clips" : "no-plan" });
+      debug({ state: plan ? "no-clips" : "no-plan", t: v ? v.currentTime : undefined }); // t drives the near-playhead downloads
       return stop();
     }
 

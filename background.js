@@ -26,7 +26,7 @@
 const DEFAULTS = {
   enabled: true,
   crossQuality: true,
-  prefetchAll: true
+  prefetchAll: false // true = grab every muted original at once; false = only near the playhead
 };
 const settings = Object.assign({}, DEFAULTS);
 
@@ -487,6 +487,35 @@ function pump() {
   }
 }
 
+const NEAR_BEHIND_S = 10;
+const NEAR_AHEAD_S = 300;
+let nearKey = "";
+
+/**
+ * Download only the muted originals around where the viewer is watching:
+ * from 10 s behind to 5 min ahead of the playhead, nearest first. Queued
+ * segments outside that window are dropped (a seek moves the window).
+ */
+function prefetchNear(tabId, t) {
+  const report = tabReports.get(tabId);
+  if (!report || settings.prefetchAll) return;
+  const near = [];
+  for (const row of report.ranges) {
+    if (!row.times || row.endSec < t - NEAR_BEHIND_S || row.id > t + NEAR_AHEAD_S) continue;
+    row.urls.forEach((u, i) => {
+      const at = row.times[i];
+      if (at + 10 >= t - NEAR_BEHIND_S && at <= t + NEAR_AHEAD_S && !cacheIndex.has(u)) near.push([at, u]);
+    });
+  }
+  near.sort((a, b) => a[0] - b[0]);
+  const key = near.map((x) => x[1]).join();
+  if (key === nearKey) return pump();
+  nearKey = key;
+  queue.length = 0;
+  for (const [, u] of near) queue.push(u);
+  pump();
+}
+
 function enqueue(urls) {
   for (const url of urls) if (!cacheIndex.has(url)) queue.push(url);
   pump();
@@ -710,15 +739,18 @@ async function processPlaylist(body, playlistUrl, tabId) {
         cached: 0,
         missing: 0,
         injected: 0,
-        urls: []
+        urls: [],
+        times: []
       };
       report.ranges.push(row);
     }
     row.urls = [];
+    row.times = [];
     for (const seg of range.segments) {
       const abs = new URL(seg.path, playlistUrl).href;
       owner.set(abs, { tabId, rangeId: id }); // always claim it, even if seen earlier
       row.urls.push(abs);
+      row.times.push(seg.start);
       wanted.push(abs);
     }
     // Authoritative snapshot: downloads that finished before this row existed
@@ -732,8 +764,13 @@ async function processPlaylist(body, playlistUrl, tabId) {
   report.note = null;
   recount(tabId, report);
 
-  if (settings.prefetchAll) enqueue(wanted);
-  log(`playlist:${ranges.length} muted ranges, fetching ${wanted.length} originals`, playlistUrl);
+  if (settings.prefetchAll) {
+    enqueue(wanted);
+    log(`playlist:${ranges.length} muted ranges, fetching all ${wanted.length} originals`, playlistUrl);
+  } else {
+    if (report.live && typeof report.live.t === "number") prefetchNear(tabId, report.live.t);
+    log(`playlist:${ranges.length} muted ranges, fetching originals near the playhead`, playlistUrl);
+  }
 
   return body;
 }
@@ -1434,7 +1471,10 @@ browser.runtime.onMessage.addListener((message, sender) => {
   if (message.type === "clipBytes") return clipBytes(message.slug);
   if (message.type === "kickChunk") return kickChunk(message.videoId, message.a, message.b);
   if (message.type === "clipState") {
-    if (sender.tab) reportFor(sender.tab.id).live = Object.assign({ at: Date.now() }, message.state);
+    if (sender.tab) {
+      reportFor(sender.tab.id).live = Object.assign({ at: Date.now() }, message.state);
+      if (typeof message.state.t === "number") prefetchNear(sender.tab.id, message.state.t);
+    }
     return Promise.resolve(true);
   }
   if (message.type === "clipPlaying") {

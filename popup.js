@@ -31,6 +31,7 @@ const mb = (bytes) => (bytes / 1048576).toFixed(bytes > 104857600 ? 0 : 1) + " M
 function renderRanges(report) {
   const list = $("ranges");
   list.textContent = "";
+  const gaveUp = /deleted/.test(report.note || ""); // background stopped trying: originals purged
   for (const range of report.ranges) {
     const li = document.createElement("li");
     const span = document.createElement("span");
@@ -39,18 +40,16 @@ function renderRanges(report) {
     if (range.cached === range.total) {
       tag.className = "tag ok";
       tag.textContent = "audio secured";
-    } else if (range.cached + range.missing < range.total && report.inFlight > 0) {
-      tag.className = "tag pending";
-      tag.textContent = `fetching ${range.cached}/${range.total}`;
-    } else if (range.cached + range.missing < range.total) {
-      tag.className = "tag bad";
-      tag.textContent = `stalled ${range.cached}/${range.total}`;
-    } else if (range.cached > 0) {
-      tag.className = "tag partial";
-      tag.textContent = `partial ${range.cached}/${range.total}`;
     } else if (report.kick) {
       tag.className = "tag ok";
       tag.textContent = "full audio (Kick)";
+    } else if (range.cached + range.missing < range.total && !gaveUp) {
+      // Originals are fetched only near the playhead, so untouched ranges wait.
+      tag.className = "tag pending";
+      tag.textContent = range.cached ? `fetched ${range.cached}/${range.total}` : "fetched when watched";
+    } else if (range.cached > 0) {
+      tag.className = "tag partial";
+      tag.textContent = `partial ${range.cached}/${range.total}`;
     } else if (range.clipSec > 0) {
       const whole = range.clipSec >= (range.endSec - range.id) - 1;
       tag.className = whole ? "tag ok" : "tag partial";
@@ -95,12 +94,11 @@ async function render() {
   renderRanges(report);
 
   if (report.ranges.length > 0) {
-    const pending = report.mutedSegments - report.cachedSegments - report.ranges.reduce((n, r) => n + r.missing, 0);
     setStatus([
       "Audio secured for ",
       { text: `${report.cachedSegments}/${report.mutedSegments}`, cls: "ok" },
       " muted segments",
-      pending > 0 ? ` · ${pending} still downloading` : "",
+      queued + active > 0 ? ` · ${queued + active} downloading near where you're watching` : "",
       report.injected ? ` · ${report.injected} played back unmuted` : ""
     ]);
     const c = report.clipInfo;
