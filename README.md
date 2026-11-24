@@ -17,18 +17,10 @@ A temporary add-on is removed when Firefox restarts. To keep it installed, sign 
 
 ## Use
 
-Open a VOD and hard-reload it (Ctrl+Shift+R). The popup shows each muted range and where its audio is coming from.
+Open a VOD and hard-reload it. The popup shows each muted range and where its audio is coming from.
 
 ## Limits
 
 - After about 24 h without a Kick VOD, you only get clip audio, which usually covers very little.
 - The red markers on the seek bar stay red.
 - The Twitch download button still gives you muted files.
-
-## Files
-
-| File | What it does |
-| --- | --- |
-| `background.js` | Fetches the original segments, finds the Kick VOD and clips |
-| `content.js` | Plays the Kick or clip audio in sync with the player |
-| `popup.*` | Status window |
