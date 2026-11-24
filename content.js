@@ -9,6 +9,10 @@
   const TICK_MS = 150;
   const PLAN_RETRY_MS = 2000;
   const MAX_DRIFT = 0.2;
+  // Kick chunks start/end this much past each edge. Kick's audio there is the
+  // same sound as Twitch's, so the overlap is inaudible and hides the ~40 ms
+  // an <audio> can take to start (measured gaps of 0-40 ms without it).
+  const PAD = 0.05;
   const W = 32;
   const H = 18;
   const SEARCH_S = 2.0;      // +- seconds searched around the API estimate
@@ -106,13 +110,13 @@
   /** Kick chunks are stable objects so `current.clip === clip` keeps working. */
   const kickClips = new Map();
   function kickClip(range, t, chunk) {
-    const i = Math.max(0, Math.floor((t - range.start) / chunk));
+    const i = Math.max(0, Math.floor((t + PAD - range.start) / chunk));
     const a = range.start + i * chunk;
     if (a >= range.end) return null;
     const key = "kick:" + a.toFixed(2);
     let c = kickClips.get(key);
     if (!c) {
-      c = { slug: key, kind: "kick", start: a, end: Math.min(range.end, a + chunk) };
+      c = { slug: key, kind: "kick", start: a - PAD, end: Math.min(range.end, a + chunk) + PAD };
       kickClips.set(key, c);
     }
     return c;
@@ -159,7 +163,19 @@
   function warm(clip) {
     if (!clip) return;
     const st = stateFor(clip);
-    if (st.url) player(st.url);
+    if (st.url && !players.has(st.url)) prime(player(st.url));
+  }
+
+  /** A muted play/pause starts the decoder, so the real start has no ~40 ms lag. */
+  function prime(a) {
+    a.muted = true;
+    a.play()
+      .then(() => {
+        if (audio !== a) a.pause();
+        a.currentTime = 0;
+      })
+      .catch(() => {})
+      .finally(() => (a.muted = false));
   }
 
   function stateFor(clip) {
@@ -289,7 +305,10 @@
   function scheduleEdge(v, t) {
     if (edgeTimer || v.paused || v.seeking) return;
     let edge = Infinity;
-    for (const r of plan.ranges.map((x) => [x.start, x.end]).concat(real)) {
+    const pad = plan.kick ? PAD : 0;
+    const spans = plan.ranges.map((x) => [x.start - pad, x.end + pad]).concat(real);
+    if (current && current.clip.kind === "kick") spans.push([current.clip.end - PAD, Infinity]); // next chunk
+    for (const r of spans) {
       if (r[0] > t) edge = Math.min(edge, r[0]);
       if (r[1] > t) edge = Math.min(edge, r[1]);
     }
@@ -316,7 +335,8 @@
       debug({ state: "original", t });
       return stop();
     }
-    const range = plan.ranges.find((r) => t >= r.start && t < r.end);
+    const pad = plan.kick ? PAD : 0;
+    const range = plan.ranges.find((r) => t >= r.start - pad && t < r.end + pad);
     const inMuted = !!range;
     if (plan.kick) {
       // Fetch the next range's first chunk before the playhead gets there.
@@ -327,7 +347,8 @@
     if (inMuted && plan.kick) {
       // Full audio from Kick's copy of the stream, cut into chunks.
       clip = kickClip(range, t, plan.kick.chunk);
-      if (clip && clip.end - t < 25 && clip.end < range.end) warm(kickClip(range, clip.end, plan.kick.chunk));
+      const nextAt = clip ? clip.end - PAD : Infinity;
+      if (nextAt - t < 25 && nextAt < range.end) warm(kickClip(range, nextAt, plan.kick.chunk));
       pruneKick(t);
     } else if (inMuted) {
       for (const c of plan.clips) {
@@ -377,12 +398,16 @@
     }
 
     audio.volume = v.muted ? 0 : v.volume;
-    audio.playbackRate = v.playbackRate || 1;
     const want = t - (clip.start + st.shift);
     if (v.paused || v.seeking || v.readyState < 3) {
       if (!audio.paused) audio.pause();
     } else {
       if (audio.readyState >= 1 && Math.abs(audio.currentTime - want) > MAX_DRIFT) audio.currentTime = want;
+      // Seeking only fixes big drift; a steady 40-50 ms lag was measured. Run
+      // up to 10% fast/slow to pull it to ~0 (pitch is preserved).
+      const drift = want - audio.currentTime;
+      const base = v.playbackRate || 1;
+      audio.playbackRate = Math.abs(drift) > 0.01 ? base * (1 + Math.max(-0.1, Math.min(0.1, drift * 2))) : base;
       // Before metadata the position can't be set, and play() would start at 0.
       if (audio.paused && audio.readyState >= 1) {
         audio.play().then(
