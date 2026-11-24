@@ -361,8 +361,13 @@ async function getOriginalBytes(url) {
 function candidatesFor(mutedUrl) {
   const match = MUTED_SEGMENT.exec(mutedUrl);
   if (!match) return [];
-  const primary = match[1] + match[2];
-  return settings.crossQuality ? [primary].concat(altSegmentUrls(primary).slice(0, 2)) : [primary];
+  // .ts VODs keep the original as N.ts. fMP4 VODs (.mp4 segments) keep it as
+  // N-unmuted.mp4 while N.mp4 is 403 (measured on 2936966896, 12.7 h old).
+  const plain = match[1] + match[2];
+  const unmuted = match[1] + "-unmuted" + match[2];
+  const fmp4 = /^\.(mp4|m4s|m4v)/.test(match[2]);
+  const own = fmp4 ? [unmuted, plain] : [plain, unmuted];
+  return settings.crossQuality ? own.concat(altSegmentUrls(own[0]).slice(0, 2)) : own;
 }
 
 /**
@@ -1262,34 +1267,71 @@ function twitchSegUrl(playlistUrl, path) {
   return abs.origin + parts.join("/");
 }
 
+/**
+ * Kick channel names to try. Streamers often use a different name on Kick
+ * (Twitch "zackrawrr" is Kick "asmongold"), so besides the login and display
+ * name, take names from the profile's social links and @mentions in the title
+ * or bio. A wrong guess is harmless: it also needs a VOD that started within
+ * 15 min, and that VOD's audio must match Twitch's.
+ */
+function kickCandidates(owner, title) {
+  const out = [owner.login, owner.displayName];
+  const urls = ((owner.channel && owner.channel.socialMedias) || []).map((s) => s.url || "");
+  const text = [title || "", owner.description || "", ...urls].join(" ");
+  const patterns = [
+    /kick\.com\/(\w+)/gi,
+    /reddit\.com\/r\/(\w+)/gi,
+    /(?:twitter|x)\.com\/(\w+)/gi,
+    /youtube\.com\/(?:@|c\/|user\/)(\w+)/gi,
+    /(?:instagram|tiktok)\.com\/@?(\w+)/gi,
+    /@(\w+)/g
+  ];
+  for (const re of patterns) for (const m of text.matchAll(re)) out.push(m[1]);
+  const seen = new Set();
+  return out
+    .map((n) => String(n || "").toLowerCase())
+    .filter((n) => /^\w{3,25}$/.test(n) && !seen.has(n) && seen.add(n))
+    .slice(0, 8);
+}
+
 function kickFor(videoId, vodKey) {
   if (kickInfo.has(videoId)) return kickInfo.get(videoId);
   const pl = vodPlaylists.get(vodKey);
   if (!pl) return Promise.resolve(undefined); // playlist not seen yet: ask again later
   const job = (async () => {
-    const v = await gqlPost({ query: `query{video(id:"${videoId}"){createdAt lengthSeconds owner{login}}}` });
+    const v = await gqlPost({
+      query:
+        `query{video(id:"${videoId}"){createdAt lengthSeconds title owner{login displayName description ` +
+        `channel{socialMedias{url}}}}}`
+    });
     const video = v && v.data && v.data.video;
-    const login = video && video.owner && video.owner.login;
-    if (!login || !/^\w+$/.test(login)) return null;
-    const res = await timedFetch(`https://kick.com/api/v2/channels/${login}/videos`, false);
-    if (!res.ok) {
-      note("kick:channel " + login + " HTTP " + res.status, "https://kick.com/");
-      return null;
-    }
-    const list = await res.json();
+    const owner = video && video.owner;
+    if (!owner || !/^\w+$/.test(owner.login)) return null;
+    const names = kickCandidates(owner, video.title);
     const created = Date.parse(video.createdAt);
+    // The same stream started within 15 min on one of the candidate channels.
+    const lists = await Promise.all(
+      names.map((name) =>
+        timedFetch(`https://kick.com/api/v2/channels/${name}/videos`, false)
+          .then((res) => (res.ok ? res.json() : []))
+          .catch(() => [])
+      )
+    );
     let match = null;
-    for (const k of Array.isArray(list) ? list : []) {
-      const when = Date.parse(String(k.start_time || k.created_at).replace(" ", "T") + "Z");
-      const dur = (k.duration || 0) / 1000;
-      if (!k.source || Math.abs(when - created) > 15 * 60000) continue;
-      if (dur && Math.abs(dur - video.lengthSeconds) > 900) continue;
-      if (!match || Math.abs(when - created) < match.gap) match = { k, gap: Math.abs(when - created) };
-    }
+    lists.forEach((list, i) => {
+      for (const k of Array.isArray(list) ? list : []) {
+        const when = Date.parse(String(k.start_time || k.created_at).replace(" ", "T") + "Z");
+        const dur = (k.duration || 0) / 1000;
+        if (!k.source || Math.abs(when - created) > 15 * 60000) continue;
+        if (dur && Math.abs(dur - video.lengthSeconds) > 900) continue;
+        if (!match || Math.abs(when - created) < match.gap) match = { k, gap: Math.abs(when - created), name: names[i] };
+      }
+    });
     if (!match) {
-      log(`kick:no matching VOD on kick.com/${login}`, "https://kick.com/");
+      log(`kick:no matching VOD on kick.com/{${names.join(",")}}`, "https://kick.com/");
       return null;
     }
+    log(`kick:VOD found on kick.com/${match.name}`, "https://kick.com/" + match.name);
 
     const master = await (await timedFetch(match.k.source, false)).text();
     let variant = null;
