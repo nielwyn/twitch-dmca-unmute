@@ -1,26 +1,9 @@
 "use strict";
 
 /*
- * Twitch DMCA Unmute
- *
- * v1 rewrote the playlist from "1337-muted.ts" to "1337.ts" and hoped the
- * original was still there when the player got around to requesting it. It
- * often wasn't: Twitch deletes the originals continuously, so a segment that
- * answers a probe at 00:00 can be gone by the time playback reaches it, and the
- * player gets a 403 -> silence.
- *
- * v2 never asks the player to fetch anything that can disappear. The playlist
- * is left untouched, so every request goes to "1337-muted.ts", which always
- * exists. The moment a playlist is seen, the extension downloads the unmuted
- * originals itself and keeps the bytes; when the player later requests the
- * muted segment, the response body is replaced with the saved bytes.
- *
- *   playlist seen      -> download originals NOW, store in IndexedDB
- *   player asks for    -> onHeadersReceived rewrites Content-Length
- *   1337-muted.ts         onBeforeRequest  swaps the body for the real audio
- *
- * A segment is either fully recovered or untouched. There is no 403 path left,
- * so "unmuted" can no longer degrade to "partial" mid-playback.
+ * Twitch DMCA Unmute. The playlist is left as-is; responses for muted segments
+ * get their body swapped for the downloaded original. Once originals are gone,
+ * content.js plays Kick or clip audio over the muted ranges instead.
  */
 
 const DEFAULTS = {
@@ -90,12 +73,7 @@ const tabReports = new Map();
 const queue = [];
 let activeWorkers = 0;
 
-/*
- * Per-VOD give-up. Tested on a 32 h old VOD: every one of 1280 originals was
- * 403 (plain, ranged, with cookies, page headers, every rendition, and every
- * known VOD CDN host). Once the first downloads of a VOD all fail, stop
- * hammering the CDN and say so; the clip path (below) takes over.
- */
+// Stop downloading a VOD once its first originals all fail (purged).
 const GIVE_UP_AFTER = 24;
 /** vodKey -> { ok, fail, dead } */
 const vodStats = new Map();
@@ -251,12 +229,7 @@ function timedFetch(url, withCookies, range) {
   return fetch(url, init).finally(() => clearTimeout(timer));
 }
 
-/*
- * v1 probed these segments with "Range: bytes=0-1" and got 206 for segments
- * whose full GET now returns 403. A CDN can keep serving cached byte ranges
- * after the whole object is gone, so when a full GET is refused we try to
- * rebuild the segment out of range requests before declaring it lost.
- */
+// A CDN can still serve byte ranges of an object whose full GET is 403.
 const RANGE_CHUNK = 262144;
 
 async function rangedFetch(url, withCookies) {
@@ -324,11 +297,7 @@ async function rangedFetch(url, withCookies) {
   return out.buffer;
 }
 
-/*
- * A 403 normally means Twitch deleted the original. But our fetches carry no
- * cookies, so the first few 403s are retried *with* credentials to prove which
- * it is. If cookies ever help, every later fetch uses them.
- */
+// Retry the first few 403s with cookies, in case they make a difference.
 let useCookies = false;
 let cookieTrials = 0;
 
@@ -361,8 +330,7 @@ async function getOriginalBytes(url) {
 function candidatesFor(mutedUrl) {
   const match = MUTED_SEGMENT.exec(mutedUrl);
   if (!match) return [];
-  // .ts VODs keep the original as N.ts. fMP4 VODs (.mp4 segments) keep it as
-  // N-unmuted.mp4 while N.mp4 is 403 (measured on 2936966896, 12.7 h old).
+  // .ts VODs keep the original as N.ts, fMP4 VODs as N-unmuted.mp4.
   const plain = match[1] + match[2];
   const unmuted = match[1] + "-unmuted" + match[2];
   const fmp4 = /^\.(mp4|m4s|m4v)/.test(match[2]);
@@ -370,10 +338,7 @@ function candidatesFor(mutedUrl) {
   return settings.crossQuality ? own.concat(altSegmentUrls(own[0]).slice(0, 2)) : own;
 }
 
-/**
- * Download the unmuted original for a muted segment URL and keep the bytes.
- * Idempotent: concurrent callers share one in-flight download.
- */
+/** Download and keep the original for a muted segment (concurrent calls share one download). */
 function acquire(mutedUrl) {
   const existing = cacheIndex.get(mutedUrl);
   if (existing) return existing.promise || Promise.resolve(existing);
@@ -496,11 +461,7 @@ const NEAR_BEHIND_S = 10;
 const NEAR_AHEAD_S = 300;
 let nearKey = "";
 
-/**
- * Download only the muted originals around where the viewer is watching:
- * from 10 s behind to 5 min ahead of the playhead, nearest first. Queued
- * segments outside that window are dropped (a seek moves the window).
- */
+/** Queue the originals from 10 s behind to 5 min ahead of the playhead; a seek resets it. */
 function prefetchNear(tabId, t) {
   const report = tabReports.get(tabId);
   if (!report || settings.prefetchAll) return;
@@ -685,10 +646,7 @@ function groupMutedRanges(segments) {
   return ranges;
 }
 
-/**
- * The playlist is returned UNCHANGED. Its only job here is to tell us which
- * segments are muted so we can go and fetch their originals right now.
- */
+/** Returns the playlist unchanged; records the muted ranges and queues downloads. */
 async function processPlaylist(body, playlistUrl, tabId) {
   const report = reportFor(tabId);
   counters.playlists++;
@@ -761,8 +719,7 @@ async function processPlaylist(body, playlistUrl, tabId) {
       row.durs.push(seg.duration);
       wanted.push(abs);
     }
-    // Authoritative snapshot: downloads that finished before this row existed
-    // (or came back from the cache) must still be counted.
+    // Count downloads that finished before this row existed.
     row.cached = row.urls.filter((u) => (cacheIndex.get(u) || {}).status === "have").length;
     row.missing = row.urls.filter((u) => (cacheIndex.get(u) || {}).status === "miss").length;
   }
@@ -842,11 +799,7 @@ function attachTextFilter(details, transform, { sniff }) {
 
 /* ------------------------------------------- byte injection (the segments) */
 
-/**
- * Remember which seconds now carry Twitch's real audio, so the page script
- * doesn't play Kick or clip audio on top of it. Matched by segment file name,
- * since the player may be on another rendition than the one last parsed.
- */
+/** Record which seconds now have Twitch's real audio, so content.js doesn't play over them. */
 function markReal(report, url) {
   const name = "/" + new URL(url).pathname.split("/").pop();
   for (const row of report.ranges) {
@@ -976,12 +929,7 @@ browser.tabs.onRemoved.addListener((tabId) => tabReports.delete(tabId));
 
 /* ------------------------------------------- clips: a second audio source */
 
-/*
- * Once the originals are purged, the segment files are a dead end. Clips made
- * during the live stream are separate files that the VOD mute doesn't touch.
- * We find this VOD's clips that overlap muted ranges; content.js plays their
- * audio in sync with the player while it is inside a muted range.
- */
+// Clips keep their audio; content.js plays the ones that overlap muted ranges.
 const GQL_URL = "https://gql.twitch.tv/gql";
 const GQL_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"; // Twitch's public web client
 const CLIP_TOKEN_HASH = "36b89d2507fce29e5ca551df756d27c1cfe079e2609642b4390aa4c35796eb11";
@@ -1008,16 +956,9 @@ async function gqlPost(body) {
   }
 }
 
-/*
- * Tested against Twitch (2026-11):
- *  - Paging with `after:` fails GQL's integrity check for a plain client, so
- *    instead we union several cursor-less queries (sort x period); on a big
- *    channel that found 92 clips of one VOD vs 66 from a single query.
- *  - CREATED_AT_* sorts return "server error"; VIEWS_DESC and TRENDING work.
- *  - videoOffsetSeconds is where the clip ENDS, not starts. Frame matching on
- *    4 clips put the real start at offset - duration + 0.2..1.6 s; content.js
- *    refines the remaining error by matching video frames.
- */
+// Paging with `after:` fails GQL's integrity check, so several cursor-less
+// queries are combined; CREATED_AT_* sorts error out. videoOffsetSeconds is
+// where the clip ENDS.
 const CLIP_QUERIES = [
   ["VIEWS_DESC", "LAST_DAY"], ["VIEWS_DESC", "LAST_WEEK"], ["VIEWS_DESC", "LAST_MONTH"], ["VIEWS_DESC", "ALL_TIME"],
   ["TRENDING", "LAST_DAY"], ["TRENDING", "LAST_WEEK"], ["TRENDING", "LAST_MONTH"], ["TRENDING", "ALL_TIME"]
@@ -1041,8 +982,7 @@ function clipsFor(videoId) {
 
     const bySlug = new Map();
     let ok = 0;
-    // Twitch answers some of these with a transient "service error"; a query
-    // that silently drops loses up to 100 clips, so retry, two at a time.
+    // Retry transient "service error" responses, two queries at a time.
     const runQuery = async ([sort, period]) => {
       let lastErr;
       for (let attempt = 0; attempt < 4; attempt++) {
@@ -1108,14 +1048,8 @@ function coveredSeconds(clips, ranges) {
 
 /* ------------------------------------- Kick mirror: the full-audio source */
 
-/*
- * Many streamers multistream to Kick, and Kick does not mute VODs. Tested on
- * VOD 2932113307: Kick's copy has the same length to the second, its audio is
- * the full stream audio (envelope r=0.988 vs a Twitch clip in a muted range),
- * and it is a constant 2.00 s ahead of Twitch across all 23 hours (r~1.0 at
- * 3 points). So: find the Kick VOD, measure the offset ourselves on an
- * unmuted stretch, then serve muted ranges as WAV chunks cut from Kick audio.
- */
+// Kick doesn't mute VODs: find the same stream there, measure the offset, and
+// serve muted ranges as WAV chunks cut from its audio.
 const KICK_CHUNK_S = 30; // small enough that a seek into a range gets audio quickly
 const KICK_SR = 32000;
 /** vodKey -> { url, segs } of the Twitch media playlist. */
@@ -1191,7 +1125,6 @@ function tsToAdts(u8) {
 
 /** Fetch TS segments, keep their audio, decode to mono Float32 at KICK_SR. */
 async function decodeSegments(urls) {
-  // Fetched 6 at a time: one by one, a 2-minute chunk took ~5 s to arrive.
   const adts = new Array(urls.length);
   let next = 0;
   const worker = async () => {
@@ -1267,13 +1200,7 @@ function twitchSegUrl(playlistUrl, path) {
   return abs.origin + parts.join("/");
 }
 
-/**
- * Kick channel names to try. Streamers often use a different name on Kick
- * (Twitch "zackrawrr" is Kick "asmongold"), so besides the login and display
- * name, take names from the profile's social links and @mentions in the title
- * or bio. A wrong guess is harmless: it also needs a VOD that started within
- * 15 min, and that VOD's audio must match Twitch's.
- */
+/** Kick names to try: login, display name, social links, @mentions (e.g. zackrawrr -> asmongold). */
 function kickCandidates(owner, title) {
   const out = [owner.login, owner.displayName];
   const urls = ((owner.channel && owner.channel.socialMedias) || []).map((s) => s.url || "");
@@ -1348,8 +1275,7 @@ function kickFor(videoId, vodKey) {
     const segs = parseM3u8Segments(await (await timedFetch(variant, false)).text(), variant);
     if (!segs.length) return null;
 
-    // Measure the offset on 20 s of unmuted Twitch audio (no -muted segment
-    // within +-60 s), against 100 s of Kick audio around the same time.
+    // Offset: 20 s of unmuted Twitch audio matched against 100 s of Kick audio.
     const tw = pl.segs;
     let pick = -1;
     for (let i = 6; i + 8 < tw.length; i++) {
@@ -1447,14 +1373,10 @@ async function clipPlan(videoId, tabId) {
     rep.clipStatus = "error: " + ((err && err.message) || err);
     return { ready: false, ranges: [], clips: [] };
   }
-  // Muted ranges: GQL muteInfo is authoritative and needs no playlist. Drop the
-  // ranges whose original segments are fully cached (those play via injection).
   const report = tabReports.get(tabId);
   const done = report ? report.ranges.filter((r) => r.total > 0 && r.cached === r.total) : [];
-  // The silence is exactly the playlist's -muted.ts segments. muteInfo is off
-  // at the edges: it often ends ~10 s early and can start up to 0.5 s early,
-  // which played Kick audio over Twitch's real audio. Use it only when the
-  // playlist hasn't been parsed.
+  // The silence is exactly the -muted segments; muteInfo is off at the edges,
+  // so it's only a fallback until the playlist is parsed.
   const ranges =
     report && report.ranges.length
       ? mergeRanges(report.ranges.filter((r) => !done.includes(r)).map((r) => ({ start: r.id, end: r.endSec })))
@@ -1554,16 +1476,13 @@ browser.runtime.onMessage.addListener((message, sender) => {
   if (message.type === "getReport") {
     const tabId = message.tabId === "self" && sender.tab ? sender.tab.id : message.tabId;
     const full = tabReports.get(tabId);
-    // Strip the per-range URL lists: a long VOD has thousands and the popup
-    // never needs them.
+    // The popup doesn't need the per-range URL lists.
     const report = full
       ? Object.assign({}, full, {
           clipList: undefined,
           ranges: full.ranges.map((r) => {
             const copy = Object.assign({}, r);
             delete copy.urls;
-            // Seconds of clip audio inside this range (computed here so rows
-            // parsed after the clip search still get it).
             if (full.clipList && typeof r.endSec === "number") {
               copy.clipSec = coveredSeconds(full.clipList, [{ start: r.id, end: r.endSec }]);
             }

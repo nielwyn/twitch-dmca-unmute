@@ -1,18 +1,9 @@
 "use strict";
 
 /*
- * Plays clip audio over muted VOD ranges.
- *
- * Twitch's muted segments carry pure silence (-91 dB measured), so there is no
- * double audio: while the player is inside a muted range that a clip covers, a
- * detached <audio> element plays that clip, slaved to the player's time, rate,
- * volume and pause state.
- *
- * Clip start times from the API are only good to about +-0.7 s, which is
- * visibly off for speech. So the first time a clip is used we line it up the
- * way the test harness did: sample small grayscale frames from the player,
- * decode the clip's frames around the estimate, and pick the shift whose
- * frames match best.
+ * Plays Kick or clip audio over muted VOD ranges, synced to the player.
+ * Clip start times are off by up to ~0.7 s, so clips are aligned by matching
+ * small grayscale frames against the player.
  */
 (() => {
   const TICK_MS = 150;
@@ -30,7 +21,7 @@
   let planFor = null;
   let planAt = 0;
   let audio = null;
-  let current = null;        // { clip, entry }
+  let current = null;        // { clip, entry, url }
   let playError = null;
   /** slug -> { file: Promise<string|null>, shift, sync, samples, matching } */
   const clipState = new Map();
@@ -56,7 +47,7 @@
     try {
       document.documentElement.dataset.dmcaUnmute = json;
     } catch (_) {}
-    // Live state for the popup: on change of what's happening, or every 2 s.
+    // Live state for the popup, on change or every 2 s.
     const key = [state.state, state.slug, state.sync, state.playError].join("|");
     if (key !== lastSent || Date.now() - lastSentAt > 2000) {
       lastSent = key;
@@ -68,8 +59,7 @@
     }
   }
 
-  // Firefox may refuse audible play() until the user interacts with the page.
-  // Retry on the next click/key instead of staying silent.
+  // Firefox may block play() until the user interacts; retry on the next click/key.
   let unlockArmed = false;
   function armUnlock() {
     if (unlockArmed) return;
@@ -128,7 +118,7 @@
     return c;
   }
 
-  /** Keep only the decoded Kick chunks near the playhead (each is ~7 MB). */
+  /** Keep only the Kick chunks near the playhead. */
   function pruneKick(t) {
     for (const [key, st] of clipState) {
       if (!key.startsWith("kick:")) continue;
@@ -141,11 +131,7 @@
     }
   }
 
-  /**
-   * One <audio> per chunk/clip URL. The next chunk gets its element ahead of
-   * time, so a handover is an element swap with metadata already loaded
-   * instead of a src change that stalls ~0.2 s.
-   */
+  /** One <audio> per URL, so switching to a preloaded chunk doesn't stall. */
   const players = new Map();
   function player(url) {
     let a = players.get(url);
@@ -298,11 +284,7 @@
     } catch (_) {}
   }
 
-  /**
-   * The 150 ms tick alone lands up to 150 ms late on a range edge, which is
-   * audible as Kick and Twitch overlapping (exit) or a gap (entry). When an
-   * edge is close, run one extra tick right at it.
-   */
+  /** Run an extra tick exactly at a nearby range edge (the 150 ms tick can be late). */
   let edgeTimer = 0;
   function scheduleEdge(v, t) {
     if (edgeTimer || v.paused || v.seeking) return;
@@ -323,7 +305,7 @@
     refreshPlan();
     const v = mainVideo();
     if (!v || !plan || ((!plan.clips || plan.clips.length === 0) && !plan.kick)) {
-      debug({ state: plan ? "no-clips" : "no-plan", t: v ? v.currentTime : undefined }); // t drives the near-playhead downloads
+      debug({ state: plan ? "no-clips" : "no-plan", t: v ? v.currentTime : undefined });
       return stop();
     }
 
@@ -428,8 +410,7 @@
     });
   }
 
-  // Opt-in debug: localStorage.dmcaUnmuteDebug = "1" mirrors the popup's report
-  // onto <html data-dmca-unmute-report>, so it can be inspected without the popup.
+  // Debug: localStorage.dmcaUnmuteDebug = "1" mirrors the report onto <html data-dmca-unmute-report>.
   setInterval(() => {
     let on = false;
     try {
